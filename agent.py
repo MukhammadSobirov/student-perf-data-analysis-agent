@@ -29,29 +29,34 @@ class DataInsightsAgent:
         self.model = AGENT_MODEL
         self.temperature = AGENT_TEMPERATURE
         self.conversation_history: List[Dict] = []
-        
-        # System prompt
-        self.system_prompt = """You are a helpful data insights assistant for a student performance analytics system. 
-Your role is to help users query and analyze student performance data using the available tools.
 
-Key guidelines:
-- Use the provided tools to query data instead of making assumptions
-- Only return limited results to avoid overwhelming the user
-- Provide clear, concise analysis of student performance data
-- Focus on educational insights: scores, demographics, test preparation impact
+        # Ground the model with the live database schema so the SQL it generates
+        # references real columns and valid categorical values.
+        schema_description = self.tools.data_manager.get_schema_description()
+
+        # System prompt
+        self.system_prompt = f"""You are a helpful data insights assistant for a student performance analytics system.
+Your role is to help users query and analyze student performance data by writing SQL.
+
+You have access to a read-only SQLite database with the following schema:
+
+{schema_description}
+
+How to work:
+- Answer questions by generating SQL and running it with the `execute_sql_query` tool. Do NOT invent or assume data — always query.
+- The queries you write are your own; construct the exact SQL needed for each question (filtering, aggregation, grouping, ranking, percentiles, comparisons).
+- If you are unsure about column names or valid values, call `get_database_schema` first.
+- Only SELECT/WITH (read-only) queries are allowed. Never attempt INSERT, UPDATE, DELETE, DROP, or any write/DDL operation — the system blocks these for safety.
+- Keep result sets small; a row limit is enforced automatically. Prefer aggregate queries over dumping raw rows when the user asks for summaries.
 - Suggest creating a support ticket when:
-  1. You cannot answer the user's question with available tools
+  1. You cannot answer the user's question with the database
   2. The user explicitly asks for human help
   3. The query involves operations beyond data analysis
   4. The user reports bugs or issues with the system
-- Be friendly and professional
-- Format scores clearly and provide context (e.g., "average score of 75.3 out of 100")
-- When showing data, present it in a readable format
-- When discussing demographics, be respectful and objective
-- NEVER perform write operations (INSERT, UPDATE, DELETE) - the system blocks these for safety
+- Be friendly and professional.
+- Format scores clearly and provide context (e.g., "average score of 75.3 out of 100").
+- Present results in a readable format, and when discussing demographics be respectful and objective."""
 
-Safety: This system has safety features that prevent any dangerous database operations like deleting or modifying data."""
-        
         logger.info(f"DataInsightsAgent initialized with model: {self.model}")
     
     def _should_suggest_support_ticket(self, user_message: str, assistant_response: str = "") -> bool:
@@ -224,13 +229,8 @@ Safety: This system has safety features that prevent any dangerous database oper
         """
         # Map function names to actual methods
         function_map = {
-            "search_students_by_criteria": self.tools.search_students_by_criteria,
-            "get_aggregated_statistics": self.tools.get_aggregated_statistics,
-            "get_score_analysis": self.tools.get_score_analysis,
-            "get_demographic_breakdown": self.tools.get_demographic_breakdown,
-            "get_dataset_overview": self.tools.get_dataset_overview,
-            "get_top_performers": self.tools.get_top_performers,
-            "get_test_prep_impact": self.tools.get_test_prep_impact
+            "get_database_schema": self.tools.get_database_schema,
+            "execute_sql_query": self.tools.execute_sql_query,
         }
         
         if function_name not in function_map:

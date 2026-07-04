@@ -3,12 +3,29 @@ Database module for the Student Performance Analytics App.
 Handles data loading, querying with safety checks, and operations on pandas DataFrame.
 """
 import pandas as pd
+import sqlite3
 from typing import Optional, Dict, List, Any
 import re
 from utils import setup_logger, log_safety_block
-from config import CSV_FILE_PATH, DANGEROUS_SQL_KEYWORDS
+from config import CSV_FILE_PATH, DANGEROUS_SQL_KEYWORDS, MAX_RESULTS_TO_LLM
 
 logger = setup_logger(__name__)
+
+# Name of the queryable table exposed to the AI agent.
+TABLE_NAME = "students"
+
+# Maps the raw CSV column names (with spaces/slashes) to clean SQL-friendly
+# identifiers so the LLM can write natural, unquoted SQL.
+COLUMN_MAP = {
+    "gender": "gender",
+    "race/ethnicity": "race_ethnicity",
+    "parental level of education": "parental_level_of_education",
+    "lunch": "lunch",
+    "test preparation course": "test_preparation_course",
+    "math score": "math_score",
+    "reading score": "reading_score",
+    "writing score": "writing_score",
+}
 
 
 class DataManager:
@@ -25,7 +42,9 @@ class DataManager:
         """
         self.csv_path = csv_path
         self.df: Optional[pd.DataFrame] = None
+        self.conn: Optional[sqlite3.Connection] = None
         self.load_data()
+        self._init_sqlite()
         logger.info(f"DataManager initialized with {len(self.df)} rows")
     
     def load_data(self) -> None:
@@ -46,6 +65,109 @@ class DataManager:
             logger.error(f"Error loading CSV: {str(e)}")
             raise
     
+    def _init_sqlite(self) -> None:
+        """
+        Loads the DataFrame into an in-memory SQLite table so the AI agent can
+        run generated SELECT queries against it.
+        Inputs: None
+        Outputs: None
+        """
+        # check_same_thread=False: Streamlit caches DataManager and reuses the
+        # connection across request threads.
+        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+
+        df_sql = self.df.rename(columns=COLUMN_MAP)
+        df_sql.to_sql(TABLE_NAME, self.conn, index=False, if_exists="replace")
+
+        # Defense in depth: reject any write at the engine level, regardless of
+        # what the LLM generates or what the keyword filter misses.
+        self.conn.execute("PRAGMA query_only = ON")
+        logger.info(f"Loaded data into in-memory SQLite table '{TABLE_NAME}'")
+
+    def get_schema_description(self) -> str:
+        """
+        Returns a human-readable schema of the queryable table, including column
+        types and sample values for categorical columns. Used to ground the AI
+        agent so it generates valid SQL.
+        Inputs: None
+        Outputs: schema description (string)
+        """
+        lines = [
+            f"Table: {TABLE_NAME} ({len(self.df)} rows)",
+            "Columns:",
+        ]
+        cur = self.conn.execute(f"PRAGMA table_info({TABLE_NAME})")
+        for col in cur.fetchall():
+            name, col_type = col["name"], col["type"]
+            line = f"  - {name} ({col_type})"
+            # Add distinct values for low-cardinality categorical columns.
+            if col_type.upper() in ("TEXT", ""):
+                distinct = self.conn.execute(
+                    f'SELECT DISTINCT "{name}" AS v FROM {TABLE_NAME} '
+                    f'ORDER BY v LIMIT 10'
+                ).fetchall()
+                values = [str(r["v"]) for r in distinct]
+                line += " — values: " + ", ".join(repr(v) for v in values)
+            lines.append(line)
+        return "\n".join(lines)
+
+    def execute_query(self, sql: str, limit: int = MAX_RESULTS_TO_LLM) -> Dict[str, Any]:
+        """
+        Executes an AI-generated read-only SQL query against the in-memory
+        database, with safety checks. Only single SELECT/WITH statements allowed.
+        Inputs: sql (string), limit (int)
+        Outputs: dictionary with results and metadata
+        """
+        logger.info(f"Executing AI-generated SQL: {sql}")
+
+        # 1. Keyword-based safety check (blocks INSERT/UPDATE/DELETE/DROP/...).
+        if not self.is_safe_operation(sql):
+            return {
+                "success": False,
+                "error": "Query rejected: it contains a disallowed write/DDL operation. Only read-only SELECT queries are permitted.",
+            }
+
+        # 2. Structural checks: single statement, must be a SELECT/WITH.
+        statement = sql.strip().rstrip(";").strip()
+        if ";" in statement:
+            return {
+                "success": False,
+                "error": "Only a single SQL statement is allowed.",
+            }
+
+        lowered = statement.lower()
+        if not (lowered.startswith("select") or lowered.startswith("with")):
+            return {
+                "success": False,
+                "error": "Only SELECT queries are allowed.",
+            }
+
+        # 3. Enforce a result cap so we never flood the LLM context.
+        if not re.search(r"\blimit\b", lowered):
+            statement = f"{statement} LIMIT {limit}"
+
+        # 4. Execute (PRAGMA query_only guarantees no writes reach the data).
+        try:
+            cur = self.conn.execute(statement)
+            rows = cur.fetchmany(limit)
+            results = [dict(row) for row in rows]
+            logger.info(f"SQL query returned {len(results)} rows")
+            return {
+                "success": True,
+                "sql": statement,
+                "row_count": len(results),
+                "results": results,
+                "truncated": len(results) >= limit,
+            }
+        except Exception as e:
+            logger.error(f"SQL execution error: {str(e)}")
+            return {
+                "success": False,
+                "sql": statement,
+                "error": f"SQL execution error: {str(e)}",
+            }
+
     def is_safe_operation(self, query: str) -> bool:
         """
         Checks if a query contains dangerous SQL keywords.
